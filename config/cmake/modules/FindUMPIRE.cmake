@@ -15,12 +15,12 @@
 #   - UMPIRE_INCLUDE_DIRS
 
 if (NOT umpire_DIR AND UMPIRE_DIR)
-  set(umpire_DIR ${UMPIRE_DIR}/lib/cmake/umpire)
+  set(umpire_DIR ${UMPIRE_DIR}/lib64/cmake/umpire ${UMPIRE_DIR}/lib/cmake/umpire)
 endif()
 message(STATUS "Looking for UMPIRE ...")
 message(STATUS "   in UMPIRE_DIR = ${UMPIRE_DIR}")
 message(STATUS "      umpire_DIR = ${umpire_DIR}")
-find_package(umpire CONFIG)
+find_package(umpire CONFIG PATHS ${umpire_DIR})
 set(UMPIRE_FOUND ${umpire_FOUND})
 set(UMPIRE_LIBRARIES "umpire")
 if (UMPIRE_FOUND)
