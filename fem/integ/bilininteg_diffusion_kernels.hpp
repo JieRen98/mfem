@@ -12,6 +12,8 @@
 #ifndef MFEM_BILININTEG_DIFFUSION_KERNELS_HPP
 #define MFEM_BILININTEG_DIFFUSION_KERNELS_HPP
 
+#include <cuda/atomic>
+
 #include "../kernel_dispatch.hpp"
 #include "../../config/config.hpp"
 #include "../../general/array.hpp"
@@ -2000,8 +2002,8 @@ inline void SmemPADiffusionApplyTetrahedron(const int NE,
       Ga1_initialized<T_D1D, T_Q1D> = true;
    }
 
-   static const int BLK = std::max(Q1D, D1D-1);
-   static const int BZ = 128 / (BLK * BLK);
+   static constexpr int BLK = std::max(Q1D, D1D-1);
+   static constexpr int BZ = 128 / (BLK * BLK);
 
    mfem::forall_2D_batch(NE, BLK, BLK, BZ, [=] MFEM_HOST_DEVICE (int e)
    {
@@ -2014,9 +2016,11 @@ inline void SmemPADiffusionApplyTetrahedron(const int NE,
       constexpr int BASIS_DIM2D_DIFF = (MD1-1) * MD1 / 2;
       constexpr int BASIS_DIM3D_DIFF = (MD1-1) * MD1 * (MD1 + 1) / 6;
 
+      static constexpr int lds = (BLK == 2 || BLK == 4 || BLK == 8) ? BLK + 1 : BLK;
+
       MFEM_SHARED real_t Ga3[BASIS_DIM3D_DIFF][MQ1];
       MFEM_SHARED real_t Ga2[BASIS_DIM2D_DIFF][MQ1];
-      MFEM_SHARED real_t sm0[BZ][3][BLK][BLK][BLK];
+      MFEM_SHARED real_t sm0[BZ][3][BLK][BLK][lds];
       auto X = (real_t (*)) (sm0[MFEM_THREAD_ID(z)]);
       auto DDQ0 = sm0[MFEM_THREAD_ID(z)][0];
       auto DDQ1 = sm0[MFEM_THREAD_ID(z)][1];
@@ -2333,6 +2337,13 @@ inline void SmemPADiffusionApplyTetrahedron(const int NE,
 
          MFEM_SYNC_THREAD;
 
+         for (int i = local_2d_id; i < BASIS_DIM3D; i += BLK * BLK)
+         {
+            X[i] = y(i,e);
+         }
+
+         MFEM_SYNC_THREAD;
+
          if (int a1 = MFEM_THREAD_ID(y); a1 < D1D-1)
          {
             if (int a2 = MFEM_THREAD_ID(x); a2 < D1D-a1-1)
@@ -2353,41 +2364,19 @@ inline void SmemPADiffusionApplyTetrahedron(const int NE,
                     w += ws[i3] * Ga3[a][i3];
                  }
 
-                 int idx = ijk_to_index(D1D, a1, a2, a3);
-   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
-                 atomicAdd(&y(idx,e), -p2 * (u + v + w));
-   #else
-                 y(idx,e) -= p2 * (u + v + w);
-                 MFEM_SYNC_THREAD;
-   #endif
-
-                 idx = ijk_to_index(D1D, a1 + 1, a2, a3);
-
-   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
-                 atomicAdd(&y(idx,e), p2 * u);
-   #else
-                 y(idx,e) += p2 * u;
-                 MFEM_SYNC_THREAD;
-   #endif
-
-                 idx = ijk_to_index(D1D, a1, a2 + 1, a3);
-
-   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
-                 atomicAdd(&y(idx,e), p2 * v);
-   #else
-                 y(idx,e) += p2 * v;
-                 MFEM_SYNC_THREAD;
-   #endif
-
-                 idx = ijk_to_index(D1D, a1, a2, a3 + 1);
-   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
-                 atomicAdd(&y(idx,e), p2 * w);
-   #else
-                 y(idx,e) += p2 * w;
-                 MFEM_SYNC_THREAD;
-   #endif
+                 reinterpret_cast<cuda::atomic<real_t, cuda::thread_scope_block>*>(&X[ijk_to_index(D1D, a1, a2, a3)])->fetch_add(-p2 * (u + v + w), cuda::memory_order_relaxed);
+                 reinterpret_cast<cuda::atomic<real_t, cuda::thread_scope_block>*>(&X[ijk_to_index(D1D, a1+1, a2, a3)])->fetch_add(p2 * u, cuda::memory_order_relaxed);
+                 reinterpret_cast<cuda::atomic<real_t, cuda::thread_scope_block>*>(&X[ijk_to_index(D1D, a1, a2+1, a3)])->fetch_add(p2 * v, cuda::memory_order_relaxed);
+                 reinterpret_cast<cuda::atomic<real_t, cuda::thread_scope_block>*>(&X[ijk_to_index(D1D, a1, a2, a3+1)])->fetch_add(p2 * w, cuda::memory_order_relaxed);
               }
             }
+         }
+
+         MFEM_SYNC_THREAD;
+
+         for (int i = local_2d_id; i < BASIS_DIM3D; i += BLK * BLK)
+         {
+            y(i,e) = X[i];
          }
       }
    });
