@@ -2041,12 +2041,14 @@ inline void SmemPADiffusionApplyTetrahedron(const int NE,
       const int local_3d_id = MFEM_THREAD_ID(x) + MFEM_THREAD_ID(y) * BLK + MFEM_THREAD_ID(z) * BLK * BLK;
       const int local_2d_id = MFEM_THREAD_ID(x) + MFEM_THREAD_ID(y) * BLK;
 
-      for (int i = local_3d_id; i < Q1D * BASIS_DIM2D_DIFF; i += BLK * BLK * BZ)
+      const int alive_thread_count = BLK * BLK * min(BZ, NE - MFEM_BLOCK_ID(x) * BZ);
+
+      for (int i = local_3d_id; i < Q1D * BASIS_DIM2D_DIFF; i += alive_thread_count)
       {
          ((real_t *)Ga2)[i] = ga2_ptr[i];
       }
 
-      for (int i = local_3d_id; i < Q1D * BASIS_DIM3D_DIFF; i += BLK * BLK * BZ)
+      for (int i = local_3d_id; i < Q1D * BASIS_DIM3D_DIFF; i += alive_thread_count)
       {
          ((real_t *)Ga3)[i] = ga3_ptr[i];
       }
