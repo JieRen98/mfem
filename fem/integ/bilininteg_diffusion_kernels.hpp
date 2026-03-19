@@ -2003,7 +2003,7 @@ inline void SmemPADiffusionApplyTetrahedron(const int NE,
    }
 
    static constexpr int BLK = std::max(Q1D, D1D-1);
-   static constexpr int BZ = 128 / (BLK * BLK);
+   static constexpr int BZ = std::min(64, 128 / (BLK * BLK));
 
    mfem::forall_2D_batch(NE, BLK, BLK, BZ, [=] MFEM_HOST_DEVICE (int e)
    {
@@ -2018,25 +2018,30 @@ inline void SmemPADiffusionApplyTetrahedron(const int NE,
 
       static constexpr int lds = (BLK == 2 || BLK == 4 || BLK == 8) ? BLK + 1 : BLK;
 
+      MFEM_SHARED union
+      {
+         real_t contraction[BZ][3][BLK][BLK][lds];
+         real_t X[BZ][BASIS_DIM3D];
+      } sm0;
+
       MFEM_SHARED real_t Ga3[BASIS_DIM3D_DIFF][MQ1];
       MFEM_SHARED real_t Ga2[BASIS_DIM2D_DIFF][MQ1];
-      MFEM_SHARED real_t sm0[BZ][3][BLK][BLK][lds];
-      auto X = (real_t (*)) (sm0[MFEM_THREAD_ID(z)]);
-      auto DDQ0 = sm0[MFEM_THREAD_ID(z)][0];
-      auto DDQ1 = sm0[MFEM_THREAD_ID(z)][1];
-      auto DDQ2 = sm0[MFEM_THREAD_ID(z)][2];
-      auto DQQ0 = sm0[MFEM_THREAD_ID(z)][0];
-      auto DQQ1 = sm0[MFEM_THREAD_ID(z)][1];
-      auto DQQ2 = sm0[MFEM_THREAD_ID(z)][2];
-      auto QQQ0 = sm0[MFEM_THREAD_ID(z)][0];
-      auto QQQ1 = sm0[MFEM_THREAD_ID(z)][1];
-      auto QQQ2 = sm0[MFEM_THREAD_ID(z)][2];
-      auto QQD0 = sm0[MFEM_THREAD_ID(z)][0];
-      auto QQD1 = sm0[MFEM_THREAD_ID(z)][1];
-      auto QQD2 = sm0[MFEM_THREAD_ID(z)][2];
-      auto QDD0 = sm0[MFEM_THREAD_ID(z)][0];
-      auto QDD1 = sm0[MFEM_THREAD_ID(z)][1];
-      auto QDD2 = sm0[MFEM_THREAD_ID(z)][2];
+      auto X = sm0.X[MFEM_THREAD_ID(z)];
+      auto DDQ0 = sm0.contraction[MFEM_THREAD_ID(z)][0];
+      auto DDQ1 = sm0.contraction[MFEM_THREAD_ID(z)][1];
+      auto DDQ2 = sm0.contraction[MFEM_THREAD_ID(z)][2];
+      auto DQQ0 = sm0.contraction[MFEM_THREAD_ID(z)][0];
+      auto DQQ1 = sm0.contraction[MFEM_THREAD_ID(z)][1];
+      auto DQQ2 = sm0.contraction[MFEM_THREAD_ID(z)][2];
+      auto QQQ0 = sm0.contraction[MFEM_THREAD_ID(z)][0];
+      auto QQQ1 = sm0.contraction[MFEM_THREAD_ID(z)][1];
+      auto QQQ2 = sm0.contraction[MFEM_THREAD_ID(z)][2];
+      auto QQD0 = sm0.contraction[MFEM_THREAD_ID(z)][0];
+      auto QQD1 = sm0.contraction[MFEM_THREAD_ID(z)][1];
+      auto QQD2 = sm0.contraction[MFEM_THREAD_ID(z)][2];
+      auto QDD0 = sm0.contraction[MFEM_THREAD_ID(z)][0];
+      auto QDD1 = sm0.contraction[MFEM_THREAD_ID(z)][1];
+      auto QDD2 = sm0.contraction[MFEM_THREAD_ID(z)][2];
 
       const int local_3d_id = MFEM_THREAD_ID(x) + MFEM_THREAD_ID(y) * BLK + MFEM_THREAD_ID(z) * BLK * BLK;
       const int local_2d_id = MFEM_THREAD_ID(x) + MFEM_THREAD_ID(y) * BLK;
