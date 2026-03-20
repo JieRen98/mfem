@@ -1035,6 +1035,27 @@ inline void PADiffusionApplyTriangle(const int NE,
    });
 }
 
+#if (defined(MFEM_USE_CUDA) && defined(__CUDACC__))
+template<int T_D1D, int T_Q1D>
+__constant__ real_t Ga1[T_D1D-1][T_Q1D];
+
+template<int T_D1D, int T_Q1D>
+int Ga1_initialized = false;
+#endif
+
+MFEM_HOST_DEVICE inline int ij_to_index(const int p, const int i, const int j) {
+   return i * (2 * p - i + 1) / 2 + j;
+}
+
+MFEM_HOST_DEVICE inline int ijk_to_index(const int p, const int i, const int j, const int k) {
+   const int n = p - k;
+
+   const int layer_sum = (p * (p + 1) * (p + 2) - n * (n + 1) * (n + 2)) / 6;
+
+   const int offset_in_layer = j * (2 * n - j + 1) / 2 + i;
+
+   return layer_sum + offset_in_layer;
+}
 
 template<int T_D1D = 0, int T_Q1D = 0>
 inline void SmemPADiffusionApplyTriangle(const int NE,
@@ -1050,95 +1071,111 @@ inline void SmemPADiffusionApplyTriangle(const int NE,
                                          const Vector &d_,
                                          const Vector &x_,
                                          Vector &y_,
-                                         const int d1d = 0,
-                                         const int q1d = 0)
+                                         const int,
+                                         const int)
 {
-   const int D1D = T_D1D ? T_D1D : d1d;
-   const int Q1D = T_Q1D ? T_Q1D : q1d;
+   const int D1D = T_D1D;
+   const int Q1D = T_Q1D;
    const int BASIS_DIM = D1D * (D1D+1) / 2;
    MFEM_VERIFY(D1D <= DeviceDofQuadLimits::Get().MAX_D1D, "");
    MFEM_VERIFY(Q1D <= DeviceDofQuadLimits::Get().MAX_Q1D, "");
-   const auto lex_map__ = DeviceTensor<2,const int>(lex_map_.Read(), D1D, D1D);
-   const auto ga1 = ConstDeviceMatrix(ga1_.Read(), Q1D, D1D-1);
-   const auto ga2 = ConstDeviceCube(ga2_.Read(), Q1D, D1D-1, D1D-1);
+   // const auto lex_map__ = DeviceTensor<2,const int>(lex_map_.Read(), D1D, D1D);
+   // const auto ga1 = ConstDeviceMatrix(ga1_.Read(), Q1D, D1D-1);
+   // const auto ga2 = ConstDeviceCube(ga2_.Read(), Q1D, D1D-1, D1D-1);
+   const auto ga2_ptr = ga2_.Read();
    const auto D = Reshape(d_.Read(), Q1D, Q1D, symmetric ? 3 : 4, NE);
    const auto x = Reshape(x_.Read(), BASIS_DIM, NE);
    auto Y = Reshape(y_.ReadWrite(), BASIS_DIM, NE);
    int p2 = (D1D-1) * (D1D-1);
 
-   mfem::forall_2D(NE, Q1D, Q1D, [=] MFEM_HOST_DEVICE (int e)
+   if (!Ga1_initialized<T_D1D, T_Q1D>)
    {
-      const int tidz = MFEM_THREAD_ID(z);
-      const int D1D = T_D1D ? T_D1D : d1d;
-      const int Q1D = T_Q1D ? T_Q1D : q1d;
+      MFEM_GPU_CHECK(cudaMemcpyToSymbol(Ga1<D1D, Q1D>, ga1_.Read(), sizeof(Ga1<D1D, Q1D>), 0, cudaMemcpyDeviceToDevice));
+      Ga1_initialized<T_D1D, T_Q1D> = true;
+   }
+
+   static const int BLK = std::max(Q1D, D1D-1);
+   static const int BZ = std::min(64, 128 / BLK);
+
+   mfem::forall_2D_batch(NE, Q1D, 1, BZ, [=] MFEM_HOST_DEVICE (int e)
+   {
+#if !defined(__CUDA_ARCH__)
+MFEM_ABORT("Non CUDA diffusion partial assemble is not implemented");
+#endif
+
+      const int D1D = T_D1D;
+      const int Q1D = T_Q1D;
       constexpr int MQ1 = T_Q1D ? T_Q1D : DofQuadLimits::MAX_Q1D;
       constexpr int MD1 = T_D1D ? T_D1D : DofQuadLimits::MAX_D1D;
       constexpr int MDQ = (MQ1 > MD1) ? MQ1 : MD1;
       constexpr int BASIS_DIM = MD1 * (MD1+1) / 2;
 
-      MFEM_SHARED real_t sBG[2][MQ1*MD1*MD1];
-      auto Ga1 = (real_t (*)[MD1]) (sBG+0);
-      auto Ga2 = (real_t (*)[MD1][MD1]) (sBG+1);
-      MFEM_SHARED real_t Xz[BASIS_DIM];
-      MFEM_SHARED real_t GD[2][MDQ][MDQ];
-      MFEM_SHARED real_t GQ[2][MDQ][MDQ];
-      auto X = (real_t (*))(Xz + tidz);
-      auto DQ0 = (real_t (*)[MQ1])(GD[0]);
-      auto DQ1 = (real_t (*)[MQ1])(GD[1]);
-      auto QQ0 = (real_t (*)[MQ1])(GQ[0]);
-      auto QQ1 = (real_t (*)[MQ1])(GQ[1]);
-      MFEM_SHARED int s_lex[MD1*MD1];
-      auto lex_map = (int (*)[MD1])(s_lex);
+      MFEM_SHARED real_t Ga2[D1D-1][D1D-1][MQ1];
+      MFEM_SHARED real_t GD[BZ][2][MDQ][MDQ];
+
+      MFEM_SHARED union
+      {
+         real_t Xz[BZ][BASIS_DIM];
+         real_t GQ[BZ][2][MDQ][MDQ];
+      } Xz_GQ;
+      auto Xz = Xz_GQ.Xz;
+      auto GQ = Xz_GQ.GQ;
+
+      auto X = Xz[MFEM_THREAD_ID(z)];
+      auto DQ0 = (real_t (*)[MQ1])(GD[MFEM_THREAD_ID(z)][0]);
+      auto DQ1 = (real_t (*)[MQ1])(GD[MFEM_THREAD_ID(z)][1]);
+      auto QQ0 = (real_t (*)[MQ1])(GQ[MFEM_THREAD_ID(z)][0]);
+      auto QQ1 = (real_t (*)[MQ1])(GQ[MFEM_THREAD_ID(z)][1]);
 
       // load in input vector and basis data
-      MFEM_FOREACH_THREAD(a1,y,D1D)
+      const int local_3d_id = MFEM_THREAD_ID(x) + MFEM_THREAD_ID(z) * BLK;
+      const int local_2d_id = MFEM_THREAD_ID(x);
+
+      const int alive_thread_count = BLK * min(BZ, NE - MFEM_BLOCK_ID(x) * BZ);
+
+      for (int i = local_3d_id; i < Q1D * (D1D-1) * (D1D-1); i += alive_thread_count)
       {
-         MFEM_FOREACH_THREAD(a2,x,D1D-a1)
-         {
-            const int idx = lex_map__(a2,a1);
-            lex_map[a1][a2] = idx;
-            X[idx] = x(idx,e);
-         }
+         ((real_t *)Ga2)[i] = ga2_ptr[i];
       }
-      MFEM_SYNC_THREAD;
-      MFEM_FOREACH_THREAD(a1,y,D1D-1)
+
+      for (int i = local_2d_id; i < BASIS_DIM; i += BLK)
       {
-         MFEM_FOREACH_THREAD(i1,x,Q1D)
-         {
-            Ga1[i1][a1] = ga1(i1,a1);
-            for (int a2 = 0; a2 < D1D-a1-1; a2++)
-            {
-               Ga2[i1][a1][a2] = ga2(i1,a1,a2);
-            }
-         }
+         X[i] = x(i,e);
       }
+
       MFEM_SYNC_THREAD;
       // DQ corresponds to C1 in AAD algorithm
-      MFEM_FOREACH_THREAD(a1,y,D1D-1)
+      if (int a1 = MFEM_THREAD_ID(x); a1 < D1D-1)
       {
-         MFEM_FOREACH_THREAD(i2,x,Q1D)
+         MFEM_UNROLL(Q1D)
+         for (int i2 = 0; i2 < Q1D; i2++)
          {
             real_t uu = 0.0, vv = 0.0;
-            for (int a2 = 0; a2 < D1D-a1-1; ++a2)
+            MFEM_UNROLL(D1D-1)
+            for (int a2 = 0; a2 < D1D-1; ++a2)
             {
+               if (a2 >= D1D-a1-1)
+               {
+                  break;
+               }
                real_t u = 0.0, v = 0.0;
                // k=0, component 0
-               int idx = lex_map[a1+1][a2];
+               int idx = ij_to_index(D1D, a2, a1+1);
                u += X[idx];
 
                // k=2, component 0
-               idx = lex_map[a1][a2];
+               idx = ij_to_index(D1D, a2, a1);
                u -= X[idx];
 
                // k=1, component 1
-               idx = lex_map[a1][a2+1];
+               idx = ij_to_index(D1D, a2+1, a1);
                v += X[idx];
 
                // k=2, component 1
-               idx = lex_map[a1][a2];
+               idx = ij_to_index(D1D, a2, a1);
                v -= X[idx];
 
-               const real_t Gai = Ga2[i2][a1][a2];
+               const real_t Gai = Ga2[a2][a1][i2];
                uu += u * Gai;
                vv += v * Gai;
             }
@@ -1148,32 +1185,34 @@ inline void SmemPADiffusionApplyTriangle(const int NE,
       }
       MFEM_SYNC_THREAD;
       // QQ corresponds to C2 in AAD algorithm
-      MFEM_FOREACH_THREAD(i1,y,Q1D)
+      if (int i2 = MFEM_THREAD_ID(x); i2 < Q1D)
       {
-         MFEM_FOREACH_THREAD(i2,x,Q1D)
+         real_t us[D1D-1], vs[D1D-1];
+         MFEM_UNROLL(D1D-1)
+         for (int a1 = 0; a1 < D1D-1; a1++)
+         {
+            us[a1] = DQ0[a1][i2];
+            vs[a1] = DQ1[a1][i2];
+         }
+
+         MFEM_UNROLL(Q1D)
+         for (int i1 = 0; i1 < Q1D; i1++)
          {
             real_t u = 0.0, v = 0.0;
+            MFEM_UNROLL(D1D-1)
             for (int a1 = 0; a1 < D1D-1; a1++)
             {
-               const real_t Gai = Ga1[i1][a1];
-               u += DQ0[a1][i2] * Gai;
-               v += DQ1[a1][i2] * Gai;
+               const real_t Gai = Ga1<D1D, Q1D>[a1][i1];
+               u += us[a1] * Gai;
+               v += vs[a1] * Gai;
             }
-            QQ0[i1][i2] = u;
-            QQ1[i1][i2] = v;
-         }
-      }
-      MFEM_SYNC_THREAD;
-      MFEM_FOREACH_THREAD(i1,y,Q1D)
-      {
-         MFEM_FOREACH_THREAD(i2,x,Q1D)
-         {
+
             const real_t O11 = D(i1, i2, 0, e);
             const real_t O21 = D(i1, i2, 1, e);
             const real_t O12 = symmetric ? O21 : D(i1, i2, 2, e);
             const real_t O22 = symmetric ? D(i1, i2, 2, e) : D(i1, i2, 3, e);
-            const real_t gX = QQ0[i1][i2];
-            const real_t gY = QQ1[i1][i2];
+            const real_t gX = u;
+            const real_t gY = v;
 
             QQ0[i1][i2] = (O11 * gX) + (O12 * gY);
             QQ1[i1][i2] = (O21 * gX) + (O22 * gY);
@@ -1181,44 +1220,79 @@ inline void SmemPADiffusionApplyTriangle(const int NE,
       }
       MFEM_SYNC_THREAD;
       // DQ corresponds to F1 in AAD algorithm
-      MFEM_FOREACH_THREAD(i2,y,Q1D)
+      if (int i2 = MFEM_THREAD_ID(x); i2 < Q1D)
       {
-         MFEM_FOREACH_THREAD(a1,x,D1D-1)
+         real_t us[Q1D], vs[Q1D];
+
+         MFEM_UNROLL(Q1D)
+         for (int i1 = 0; i1 < Q1D; i1++)
+         {
+            us[i1] = QQ0[i1][i2];
+            vs[i1] = QQ1[i1][i2];
+         }
+
+         MFEM_UNROLL(D1D-1)
+         for (int a1 = 0; a1 < D1D-1; a1++)
          {
             real_t u = 0.0, v = 0.0;
+            MFEM_UNROLL(Q1D)
             for (int i1 = 0; i1 < Q1D; i1++)
             {
-               u += QQ0[i1][i2] * Ga1[i1][a1];
-               v += QQ1[i1][i2] * Ga1[i1][a1];
+               u += us[i1] * Ga1<D1D, Q1D>[a1][i1];
+               v += vs[i1] * Ga1<D1D, Q1D>[a1][i1];
             }
             DQ0[a1][i2] = u;
             DQ1[a1][i2] = v;
          }
       }
       MFEM_SYNC_THREAD;
-      // compute F2 from AAD algorithm and add contributions to RHS
-      MFEM_FOREACH_THREAD(a1,y,D1D-1)
+
+      for (int i = local_2d_id; i < BASIS_DIM; i += BLK)
       {
-         MFEM_FOREACH_THREAD(a2,x,D1D-a1-1)
+         X[i] = Y(i,e);
+      }
+      MFEM_SYNC_THREAD;
+      // compute F2 from AAD algorithm and add contributions to RHS
+      if (int a1 = MFEM_THREAD_ID(x); a1 < D1D-1)
+      {
+
+         real_t us[Q1D], vs[Q1D];
+         MFEM_UNROLL(Q1D)
+         for (int i2 = 0; i2 < Q1D; i2++)
          {
+            us[i2] = DQ0[a1][i2];
+            vs[i2] = DQ1[a1][i2];
+         }
+
+         MFEM_UNROLL(D1D-1)
+         for (int a2 = 0; a2 < D1D-1; ++a2)
+         {
+            if (a2 >= D1D-a1-1)
+            {
+               break;
+            }
             real_t u = 0.0, v = 0.0;
+            MFEM_UNROLL(Q1D)
             for (int i2 = 0; i2 < Q1D; i2++)
             {
-               u += DQ0[a1][i2] * Ga2[i2][a1][a2];
-               v += DQ1[a1][i2] * Ga2[i2][a1][a2];
+               u += us[i2] * Ga2[a2][a1][i2];
+               v += vs[i2] * Ga2[a2][a1][i2];
             }
+
+
+            using Atomic = cuda::atomic<real_t, cuda::thread_scope_block>;
             // k=0
-            int idx = lex_map[a1+1][a2];
-            Y(idx,e) += p2 * u;
-
+            reinterpret_cast<Atomic*>(&X[ij_to_index(D1D, a2, a1+1)])->fetch_add(p2 * u, cuda::memory_order_relaxed);
             // k=1
-            idx = lex_map[a1][a2+1];
-            Y(idx,e) += p2 * v;
-
+            reinterpret_cast<Atomic*>(&X[ij_to_index(D1D, a2+1, a1)])->fetch_add(p2 * v, cuda::memory_order_relaxed);
             // k=2
-            idx = lex_map[a1][a2];
-            Y(idx,e) -= p2 * (u + v);
+            reinterpret_cast<Atomic*>(&X[ij_to_index(D1D, a2, a1)])->fetch_add(-p2 * (u + v), cuda::memory_order_relaxed);
          }
+      }
+      MFEM_SYNC_THREAD;
+      for (int i = local_2d_id; i < BASIS_DIM; i += BLK)
+      {
+         Y(i,e) = X[i];
       }
    });
 }
@@ -1928,28 +2002,6 @@ inline void PADiffusionApplyTetrahedron(const int NE,
    });
 }
 
-#if (defined(MFEM_USE_CUDA) && defined(__CUDACC__))
-template<int T_D1D, int T_Q1D>
-__constant__ real_t Ga1[T_D1D-1][T_Q1D];
-
-template<int T_D1D, int T_Q1D>
-int Ga1_initialized = false;
-#endif
-
-MFEM_HOST_DEVICE inline int ij_to_index(const int p, const int i, const int j) {
-   return i * (2 * p - i + 1) / 2 + j;
-}
-
-MFEM_HOST_DEVICE inline int ijk_to_index(const int p, const int i, const int j, const int k) {
-   const int n = p - k;
-
-   const int layer_sum = (p * (p + 1) * (p + 2) - n * (n + 1) * (n + 2)) / 6;
-
-   const int offset_in_layer = j * (2 * n - j + 1) / 2 + i;
-
-   return layer_sum + offset_in_layer;
-}
-
 // collapsed algorithm with bulk loading basis
 template<int T_D1D = 0, int T_Q1D = 0>
 inline void SmemPADiffusionApplyTetrahedron(const int NE,
@@ -2371,10 +2423,11 @@ inline void SmemPADiffusionApplyTetrahedron(const int NE,
                     w += ws[i3] * Ga3[a][i3];
                  }
 
-                 reinterpret_cast<cuda::atomic<real_t, cuda::thread_scope_block>*>(&X[ijk_to_index(D1D, a1, a2, a3)])->fetch_add(-p2 * (u + v + w), cuda::memory_order_relaxed);
-                 reinterpret_cast<cuda::atomic<real_t, cuda::thread_scope_block>*>(&X[ijk_to_index(D1D, a1+1, a2, a3)])->fetch_add(p2 * u, cuda::memory_order_relaxed);
-                 reinterpret_cast<cuda::atomic<real_t, cuda::thread_scope_block>*>(&X[ijk_to_index(D1D, a1, a2+1, a3)])->fetch_add(p2 * v, cuda::memory_order_relaxed);
-                 reinterpret_cast<cuda::atomic<real_t, cuda::thread_scope_block>*>(&X[ijk_to_index(D1D, a1, a2, a3+1)])->fetch_add(p2 * w, cuda::memory_order_relaxed);
+                 using Atomic = cuda::atomic<real_t, cuda::thread_scope_block>;
+                 reinterpret_cast<Atomic*>(&X[ijk_to_index(D1D, a1, a2, a3)])->fetch_add(-p2 * (u + v + w), cuda::memory_order_relaxed);
+                 reinterpret_cast<Atomic*>(&X[ijk_to_index(D1D, a1+1, a2, a3)])->fetch_add(p2 * u, cuda::memory_order_relaxed);
+                 reinterpret_cast<Atomic*>(&X[ijk_to_index(D1D, a1, a2+1, a3)])->fetch_add(p2 * v, cuda::memory_order_relaxed);
+                 reinterpret_cast<Atomic*>(&X[ijk_to_index(D1D, a1, a2, a3+1)])->fetch_add(p2 * w, cuda::memory_order_relaxed);
               }
             }
          }
