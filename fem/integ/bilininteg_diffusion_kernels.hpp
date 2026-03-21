@@ -1147,6 +1147,21 @@ MFEM_ABORT("Non CUDA diffusion partial assemble is not implemented");
       // DQ corresponds to C1 in AAD algorithm
       if (int a1 = MFEM_THREAD_ID(x); a1 < D1D-1)
       {
+         real_t us[D1D - 1];
+         real_t vs[D1D - 1];
+         MFEM_UNROLL(D1D-1)
+         for (int a2 = 0; a2 < D1D-1; a2++)
+         {
+            if (a1 + a2 >= D1D-1)
+            {
+               break;
+            }
+            const real_t x = X[ij_to_index(D1D, a2, a1)];
+
+            us[a2] = X[ij_to_index(D1D, a2, a1+1)] - x;
+            vs[a2] = X[ij_to_index(D1D, a2+1, a1)] - x;
+         }
+
          MFEM_UNROLL(Q1D)
          for (int i2 = 0; i2 < Q1D; i2++)
          {
@@ -1158,26 +1173,9 @@ MFEM_ABORT("Non CUDA diffusion partial assemble is not implemented");
                {
                   break;
                }
-               real_t u = 0.0, v = 0.0;
-               // k=0, component 0
-               int idx = ij_to_index(D1D, a2, a1+1);
-               u += X[idx];
-
-               // k=2, component 0
-               idx = ij_to_index(D1D, a2, a1);
-               u -= X[idx];
-
-               // k=1, component 1
-               idx = ij_to_index(D1D, a2+1, a1);
-               v += X[idx];
-
-               // k=2, component 1
-               idx = ij_to_index(D1D, a2, a1);
-               v -= X[idx];
-
                const real_t Gai = Ga2[a2][a1][i2];
-               uu += u * Gai;
-               vv += v * Gai;
+               uu += us[a2] * Gai;
+               vv += vs[a2] * Gai;
             }
             DQ0[a1][i2] = uu;
             DQ1[a1][i2] = vv;
