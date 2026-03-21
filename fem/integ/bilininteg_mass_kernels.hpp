@@ -797,6 +797,28 @@ void PAMassApplyTriangle_Element(const int e,
    }
 }
 
+#if (defined(MFEM_USE_CUDA) && defined(__CUDACC__))
+template<int T_D1D, int T_Q1D>
+__constant__ real_t Ba1[T_D1D][T_Q1D];
+
+template<int T_D1D, int T_Q1D>
+int Ba1_initialized = false;
+#endif
+
+MFEM_HOST_DEVICE inline int ij_to_index(const int p, const int i, const int j) {
+   return i * (2 * p - i + 1) / 2 + j;
+}
+
+   MFEM_HOST_DEVICE inline int ijk_to_index(const int p, const int i, const int j, const int k) {
+   const int n = p - k;
+
+   const int layer_sum = (p * (p + 1) * (p + 2) - n * (n + 1) * (n + 2)) / 6;
+
+   const int offset_in_layer = j * (2 * n - j + 1) / 2 + i;
+
+   return layer_sum + offset_in_layer;
+}
+
 template<int T_D1D, int T_Q1D, int T_NBZ, bool ACCUMULATE = true>
 MFEM_HOST_DEVICE inline
 void SmemPAMassApplyTriangle_Element(const int e,
@@ -810,130 +832,7 @@ void SmemPAMassApplyTriangle_Element(const int e,
                                      const int d1d = 0,
                                      const int q1d = 0)
 {
-   const int D1D = T_D1D ? T_D1D : d1d;
-   const int Q1D = T_Q1D ? T_Q1D : q1d;
-   constexpr int MQ1 = T_Q1D ? T_Q1D : DofQuadLimits::MAX_Q1D;
-   constexpr int MD1 = T_D1D ? T_D1D : DofQuadLimits::MAX_D1D;
-   constexpr int MDQ = (MQ1 > MD1) ? MQ1 : MD1;
-   constexpr int BASIS_DIM = MD1 * (MD1+1) / 2;
 
-   const auto lex_map__ = DeviceTensor<2,const int>(lex_map_, D1D, D1D);
-   const auto ba1 = ConstDeviceMatrix(ba1_, Q1D, D1D);
-   const auto ba2 = ConstDeviceCube(ba2_, D1D, Q1D, D1D);
-   auto D = ConstDeviceCube(d_, Q1D, Q1D, NE);
-   auto x = ConstDeviceMatrix(x_, BASIS_DIM, NE);
-   auto Y = DeviceMatrix(y_, BASIS_DIM, NE);
-
-   MFEM_SHARED real_t B[2][MQ1*MD1*MD1];
-   auto Ba1 = (real_t (*)[MD1]) (B+0);
-   auto Ba2 = (real_t (*)[MD1][MD1]) (B+1);
-   MFEM_SHARED real_t Xz[BASIS_DIM];
-   MFEM_SHARED real_t sm0[MDQ*MDQ];
-   MFEM_SHARED real_t sm1[MDQ*MDQ];
-   auto X = (real_t (*)) (Xz);
-   auto DQ = (real_t (*)[MQ1]) (sm1);
-   auto QQ = (real_t (*)[MQ1]) (sm0);
-   MFEM_SHARED int s_lex[MD1*MD1];
-   auto lex_map = (int (*)[MD1])(s_lex);
-
-   // load in input vector and basis data
-   MFEM_FOREACH_THREAD(a1,y,D1D)
-   {
-      MFEM_FOREACH_THREAD(a2,x,D1D-a1)
-      {
-         const int idx = lex_map__(a2,a1);
-         lex_map[a1][a2] = idx;
-         X[idx] = x(idx,e);
-      }
-   }
-   MFEM_SYNC_THREAD;
-   MFEM_FOREACH_THREAD(a1,y,D1D)
-   {
-      MFEM_FOREACH_THREAD(i1,x,Q1D)
-      {
-         Ba1[i1][a1] = ba1(i1,a1);
-         for (int a2 = 0; a2 < D1D-a1; ++a2)
-         {
-            Ba2[i1][a1][a2] = ba2(a2,i1,a1);
-         }
-      }
-   }
-   MFEM_SYNC_THREAD;
-   // quad to dofs operation, step 1: convert first quadrature index to first
-   // multiindex. DQ corresponds to C1 in the AAD algorithm.
-   MFEM_FOREACH_THREAD(a1,y,D1D)
-   {
-      MFEM_FOREACH_THREAD(i2,x,Q1D)
-      {
-         real_t u = 0.0;
-         for (int a2 = 0; a2 < D1D-a1; ++a2)
-         {
-            int idx = lex_map[a1][a2];
-            u += X[idx] * Ba2[i2][a1][a2];
-         }
-         DQ[a1][i2] = u;
-      }
-   }
-   MFEM_SYNC_THREAD;
-   // quad to dofs operation, step 2: convert second quadrature index to second
-   // multiindex. QQ corresponds to C2 in the AAD algorithm, which contains the Bernstein
-   // polynomial on a triangle with coefficients X evaluated at
-   // all of the Stroud quadrature nodes. E.g. if (t1,t2) is a Stroud node, then
-   //    C2[i,j] = \sum_{\alpha} X_{\alpha} * B_{\alpha}^{p-1}(\Phi(t1,t2)),
-   // where \Phi is the Duffy transform.
-   MFEM_FOREACH_THREAD(i1,y,Q1D)
-   {
-      MFEM_FOREACH_THREAD(i2,x,Q1D)
-      {
-         real_t u = 0.0;
-         for (int a1 = 0; a1 < D1D; ++a1)
-         {
-            u += DQ[a1][i2] * Ba1[i1][a1];
-         }
-         QQ[i1][i2] = u * D(i1, i2, e);
-      }
-   }
-   MFEM_SYNC_THREAD;
-   // dofs to quad operation, step 1: convert first multiindex to first quadrature
-   // index. DQ corresponds to F1 in the AAD algorithm, with F0 corresponding to
-   // C2 * D.
-   MFEM_FOREACH_THREAD(i2,y,Q1D)
-   {
-      MFEM_FOREACH_THREAD(a1,x,D1D)
-      {
-         real_t u = 0.0;
-         for (int i1 = 0; i1 < Q1D; ++i1)
-         {
-            u += QQ[i1][i2] * Ba1[i1][a1];
-         }
-         DQ[a1][i2] = u;
-      }
-   }
-   MFEM_SYNC_THREAD;
-   // dofs to quad operation, step 2: convert second multiindex to second
-   // quadrature index. u corresponds to F2 in the AAD algorithm. The contribution
-   // to the local RHS is
-   //       Y_{\alpha} = F2_{\alpha}.
-   MFEM_FOREACH_THREAD(a1,y,D1D)
-   {
-      MFEM_FOREACH_THREAD(a2,x,D1D-a1)
-      {
-         real_t u = 0.0;
-         for (int i2 = 0; i2 < Q1D; ++i2)
-         {
-            u += DQ[a1][i2] * Ba2[i2][a1][a2];
-         }
-         int idx = lex_map[a1][a2];
-         if (ACCUMULATE)
-         {
-            Y(idx,e) += u;
-         }
-         else
-         {
-            Y(idx,e) = u;
-         }
-      }
-   }
 }
 
 
@@ -1113,215 +1012,7 @@ void SmemPAMassApplyTetrahedron_Element(const int e,
                                         const int d1d = 0,
                                         const int q1d = 0)
 {
-   constexpr int D1D = T_D1D ? T_D1D : d1d;
-   constexpr int Q1D = T_Q1D ? T_Q1D : q1d;
-   constexpr int MQ1 = T_Q1D ? T_Q1D : DofQuadLimits::MAX_Q1D;
-   constexpr int MD1 = T_D1D ? T_D1D : DofQuadLimits::MAX_D1D;
-   constexpr int MDQ = (MQ1 > MD1) ? MQ1 : MD1;
-   constexpr int BASIS_DIM2D_ = MD1 * (MD1 + 1) / 2;
-   constexpr int BASIS_DIM_ = MD1 * (MD1 + 1) * (MD1 + 2) / 6;
 
-   const auto ba1 = ConstDeviceMatrix(ba1_, Q1D, D1D);
-   const auto ba2 = ConstDeviceMatrix(ba2_, Q1D, BASIS_DIM2D);
-   const auto ba3 = ConstDeviceMatrix(ba3_, Q1D, BASIS_DIM);
-   const auto d = DeviceTensor<4,const real_t>(d_, Q1D, Q1D, Q1D, NE);
-   const auto x = ConstDeviceMatrix(x_, BASIS_DIM, NE);
-   auto y = DeviceMatrix(y_, BASIS_DIM, NE);
-   const auto forward_map3d__ = DeviceTensor<3,const int>(forward_map3d_, D1D, D1D,
-                                                          D1D);
-   const auto forward_map2d__ = DeviceTensor<2,const int>(forward_map2d_, D1D,
-                                                          D1D);
-   const auto inverse_map2d__ = DeviceTensor<2,const int>(inverse_map2d_, 2,
-                                                          BASIS_DIM2D);
-
-   MFEM_SHARED real_t sDQ[BASIS_DIM_*MQ1];
-   // MFEM_SHARED real_t sDQ2[BASIS_DIM2D_*MQ1];
-   // MFEM_SHARED real_t sDQ1[MD1*MQ1];
-   auto Ba1 = (real_t (*)[MQ1]) sDQ;
-   // real_t (*Ba1t)[MD1] = (real_t (*)[MD1]) sDQ;
-   auto Ba2 = (real_t (*)[MQ1]) sDQ;
-   // real_t (*Ba2t)[BASIS_DIM2D_] = (real_t (*)[BASIS_DIM2D_]) sDQ;
-   auto Ba3 = (real_t (*)[BASIS_DIM_]) sDQ;
-   // real_t (*Ba3t)[BASIS_DIM_] = (real_t (*)[BASIS_DIM_]) sDQ;
-   MFEM_SHARED real_t sm0[MDQ*MDQ*MDQ];
-   MFEM_SHARED real_t sm1[MDQ*MDQ*MDQ];
-   auto X = (real_t (*)) sm0;
-   auto C1 = (real_t (*)[MQ1]) sm1;
-   auto C2 = (real_t (*)[MQ1][MQ1]) sm0;
-   auto C3 = (real_t (*)[MQ1][MQ1]) sm1;
-   auto F1 = (real_t (*)[MQ1][MD1]) sm0;
-   auto F2 = (real_t (*)[MQ1]) sm1;
-   MFEM_SHARED int s3D[MD1*MD1*MD1];
-   MFEM_SHARED int s2D[MD1*MD1];
-   auto forward_map3d = (int (*)[MD1][MD1]) s3D;
-   auto forward_map2d = (int (*)[MD1]) s2D;
-   MFEM_SHARED int s2D_inv[BASIS_DIM2D_*2];
-   auto inverse_map2d = (int (*)[2]) s2D_inv;
-
-   MFEM_FOREACH_THREAD(a_2d,y,BASIS_DIM2D)
-   {
-      inverse_map2d[a_2d][0] = inverse_map2d__(0,a_2d);
-      inverse_map2d[a_2d][1] = inverse_map2d__(1,a_2d);
-      const int a1 = inverse_map2d[a_2d][0];
-      const int a2 = inverse_map2d[a_2d][1];
-      const int a_2d_ = forward_map2d__(a2, a1);
-      forward_map2d[a1][a2] = a_2d_;
-      MFEM_FOREACH_THREAD(i3,x,Q1D)
-      {
-         MFEM_UNROLL(MD1)
-         for (int a3 = 0; a3 < D1D-a1-a2; ++a3)
-         {
-            const int a = forward_map3d__(a3, a2, a1);
-            forward_map3d[a1][a2][a3] = a;
-            X[a] = x(a,e);
-            Ba3[i3][a] = ba3(i3,a);
-         }
-      }
-   }
-   MFEM_SYNC_THREAD;
-   MFEM_FOREACH_THREAD(a_2d,y,BASIS_DIM2D)
-   {
-      const int a1 = inverse_map2d[a_2d][0];
-      const int a2 = inverse_map2d[a_2d][1];
-      MFEM_FOREACH_THREAD(i3,x,Q1D)
-      {
-         real_t u = 0.0;
-         MFEM_UNROLL(MD1)
-         for (int a3 = 0; a3 < D1D-a1-a2; ++a3)
-         {
-            const int a = forward_map3d[a1][a2][a3];
-            u += X[a] * Ba3[i3][a];
-         }
-         C1[a_2d][i3] = u;
-      }
-   }
-   MFEM_SYNC_THREAD;
-   MFEM_FOREACH_THREAD(a_2d,y,BASIS_DIM2D) // load in Ba2
-   {
-      MFEM_FOREACH_THREAD(i2,x,Q1D)
-      {
-         Ba2[a_2d][i2] = ba2(i2,a_2d);
-      }
-   }
-   MFEM_SYNC_THREAD;
-   MFEM_FOREACH_THREAD(a1i2,y,Q1D*D1D)
-   {
-      const int i2 = a1i2 % Q1D;
-      const int a1 = (int) a1i2 / Q1D;
-      MFEM_FOREACH_THREAD(i3,x,Q1D)
-      {
-         real_t u = 0.0;
-         MFEM_UNROLL(MD1)
-         for (int a2 = 0; a2 < D1D-a1; a2++)
-         {
-            const int a_2d = forward_map2d[a1][a2];
-            u += C1[a_2d][i3] * Ba2[a_2d][i2];
-         }
-         C2[a1][i2][i3] = u;
-      }
-   }
-   MFEM_SYNC_THREAD;
-   MFEM_FOREACH_THREAD(a1i1,y,Q1D*D1D) // load in Ba1
-   {
-      const int i1 = a1i1 % Q1D;
-      const int a1 = (int) a1i1 / Q1D;
-      Ba1[a1][i1] = ba1(i1,a1);
-   }
-   MFEM_SYNC_THREAD;
-   MFEM_FOREACH_THREAD(i2i3,y,Q1D*Q1D)
-   {
-      const int i3 = i2i3 % Q1D;
-      const int i2 = (int) i2i3 / Q1D;
-      MFEM_FOREACH_THREAD(i1,x,Q1D)
-      {
-         real_t u = 0.0;
-         MFEM_UNROLL(MD1)
-         for (int a1 = 0; a1 < D1D; a1++)
-         {
-            u += C2[a1][i2][i3] * Ba1[a1][i1];
-         }
-         C3[i2][i3][i1] = u * d(i1,i2,i3,e);
-      }
-   }
-   MFEM_SYNC_THREAD;
-   MFEM_FOREACH_THREAD(i2i3,y,Q1D*Q1D)
-   {
-      const int i3 = i2i3 % Q1D;
-      const int i2 = (int) i2i3 / Q1D;
-      MFEM_FOREACH_THREAD(a1,x,D1D)
-      {
-         real_t u = 0.0;
-         MFEM_UNROLL(MQ1)
-         for (int i1 = 0; i1 < Q1D; i1++)
-         {
-            u += C3[i2][i3][i1] * Ba1[a1][i1];
-         }
-         F1[i2][i3][a1] = u;
-      }
-   }
-   MFEM_SYNC_THREAD;
-   MFEM_FOREACH_THREAD(a_2d,y,BASIS_DIM2D) // load in Ba2t
-   {
-      MFEM_FOREACH_THREAD(i2,x,Q1D)
-      {
-         Ba2[a_2d][i2] = ba2(i2,a_2d);
-      }
-   }
-   MFEM_SYNC_THREAD;
-   MFEM_FOREACH_THREAD(a_2d,y,BASIS_DIM2D)
-   {
-      const int a1 = inverse_map2d[a_2d][0];
-      MFEM_FOREACH_THREAD(i3,x,Q1D)
-      {
-         real_t u = 0.0;
-         MFEM_UNROLL(MQ1)
-         for (int i2 = 0; i2 < Q1D; i2++)
-         {
-            u += F1[i2][i3][a1] * Ba2[a_2d][i2];
-         }
-         F2[a_2d][i3] = u;
-      }
-   }
-   MFEM_SYNC_THREAD;
-   MFEM_FOREACH_THREAD(a_2d,y,BASIS_DIM2D) // load in Ba3t
-   {
-      const int a1 = inverse_map2d[a_2d][0];
-      const int a2 = inverse_map2d[a_2d][1];
-      MFEM_FOREACH_THREAD(i3,x,Q1D)
-      {
-         // MFEM_UNROLL(MD1)
-         for (int a3 = 0; a3 < D1D-a1-a2; ++a3)
-         {
-            const int a = forward_map3d[a1][a2][a3];
-            Ba3[i3][a] = ba3(i3,a);
-         }
-      }
-   }
-   MFEM_SYNC_THREAD;
-   MFEM_FOREACH_THREAD(a_2d,y,BASIS_DIM2D)
-   {
-      const int a1 = inverse_map2d[a_2d][0];
-      const int a2 = inverse_map2d[a_2d][1];
-      MFEM_FOREACH_THREAD(a3,x,D1D-a1-a2)
-      {
-         real_t u = 0.0;
-         const int a = forward_map3d[a1][a2][a3];
-         MFEM_UNROLL(MQ1)
-         for (int i3 = 0; i3 < Q1D; i3++)
-         {
-            u += F2[a_2d][i3] * Ba3[i3][a];
-         }
-         if (ACCUMULATE)
-         {
-            y(a,e) += u;
-         }
-         else
-         {
-            y(a,e) = u;
-         }
-      }
-   }
-   MFEM_SYNC_THREAD;
 }
 
 /* This function computes the action of the mass integrator for the Bernstein basis on tetrahedrons.
@@ -1845,11 +1536,11 @@ inline void SmemPAMassApply2D(const int NE,
 // PA Mass Apply 2D kernel on triangles with shared memory
 template<int T_D1D = 0, int T_Q1D = 0>
 inline void SmemPAMassApplyTriangle(const int NE,
-                                    const Array<int> &lex_map_,
-                                    const Array<int> &forward_map2d_,
-                                    const Array<int> &inverse_map2d_,
-                                    const Array<int> &forward_map3d_,
-                                    const Array<int> &inverse_map3d_,
+                                    const Array<int> &,
+                                    const Array<int> &,
+                                    const Array<int> &,
+                                    const Array<int> &,
+                                    const Array<int> &,
                                     const Array<real_t> &ba1_,
                                     const Array<real_t> &ba2_,
                                     const Array<real_t> &ba3_, // unused in 2D...
@@ -1863,7 +1554,6 @@ inline void SmemPAMassApplyTriangle(const int NE,
                                     const int d1d = 0,
                                     const int q1d = 0)
 {
-   static constexpr int T_NBZ = mass::NBZ(T_D1D);
    const int D1D = T_D1D ? T_D1D : d1d;
    const int Q1D = T_Q1D ? T_Q1D : q1d;
    const int max_q1d = T_Q1D ? T_Q1D : DeviceDofQuadLimits::Get().MAX_Q1D;
@@ -1871,18 +1561,178 @@ inline void SmemPAMassApplyTriangle(const int NE,
    MFEM_VERIFY(D1D <= max_d1d, "");
    MFEM_VERIFY(Q1D <= max_q1d, "");
 
-   const auto lex_map = lex_map_.Read();
-   const auto Ba1 = ba1_.Read();
-   const auto Ba2 = ba2_.Read();
-   const auto D = d_.Read();
-   const auto X = x_.Read();
-   auto Y = y_.ReadWrite();
+   const auto Ba2_ptr = ba2_.Read();
+   const auto D_ptr = d_.Read();
+   const auto X_ptr = x_.Read();
+   auto Y_ptr = y_.ReadWrite();
 
-   mfem::forall_2D(NE, D1D, D1D, [=] MFEM_HOST_DEVICE (int e)
+   if (!Ba1_initialized<T_D1D, T_Q1D>)
    {
-      internal::SmemPAMassApplyTriangle_Element<T_D1D,T_Q1D,T_NBZ>(e, NE, lex_map,
-                                                                   Ba1, Ba2, D, X,
-                                                                   Y, d1d, q1d);
+      MFEM_GPU_CHECK(cudaMemcpyToSymbol(Ba1<D1D, Q1D>, ba1_.Read(), sizeof(Ba1<D1D, Q1D>), 0, cudaMemcpyDeviceToDevice));
+      Ba1_initialized<T_D1D, T_Q1D> = true;
+   }
+
+   static const int BLK = std::max(D1D, Q1D);
+   static const int BZ = std::min(64, 128 / BLK);
+
+   mfem::forall_2D_batch(NE, BLK, 1, BZ, [=] MFEM_HOST_DEVICE (int e)
+   {
+      const int D1D = T_D1D;
+      const int Q1D = T_Q1D;
+      constexpr int MQ1 = T_Q1D ? T_Q1D : DofQuadLimits::MAX_Q1D;
+      constexpr int MD1 = T_D1D ? T_D1D : DofQuadLimits::MAX_D1D;
+      constexpr int MDQ = (MQ1 > MD1) ? MQ1 : MD1;
+      constexpr int BASIS_DIM = MD1 * (MD1+1) / 2;
+
+      auto D = ConstDeviceCube(D_ptr, Q1D, Q1D, NE);
+      auto x = ConstDeviceMatrix(X_ptr, BASIS_DIM, NE);
+      auto Y = DeviceMatrix(Y_ptr, BASIS_DIM, NE);
+
+      MFEM_SHARED real_t Ba2[D1D][Q1D][D1D];
+      MFEM_SHARED real_t sm1[BZ][MDQ*MDQ];
+      auto DQ = (real_t (*)[MQ1]) (sm1[MFEM_THREAD_ID(z)]);
+
+      MFEM_SHARED union
+      {
+         real_t Xz[BZ][BASIS_DIM];
+         real_t QQ[BZ][MDQ][MDQ];
+      } Xz_QQ;
+      auto X = Xz_QQ.Xz[MFEM_THREAD_ID(z)];
+      auto QQ = Xz_QQ.QQ[MFEM_THREAD_ID(z)];
+
+      // load in input vector and basis data
+      const int local_3d_id = MFEM_THREAD_ID(x) + MFEM_THREAD_ID(z) * BLK;
+      const int local_2d_id = MFEM_THREAD_ID(x);
+
+      const int alive_thread_count = BLK * min(BZ, NE - MFEM_BLOCK_ID(x) * BZ);
+
+      for (int i = local_3d_id; i < Q1D * D1D * D1D; i += alive_thread_count)
+      {
+         ((real_t *)Ba2)[i] = Ba2_ptr[i];
+      }
+
+      for (int i = local_2d_id; i < BASIS_DIM; i += BLK)
+      {
+         X[i] = x(i,e);
+      }
+      MFEM_SYNC_THREAD;
+      // quad to dofs operation, step 1: convert first quadrature index to first
+      // multiindex. DQ corresponds to C1 in the AAD algorithm.
+      if (int a1 = MFEM_THREAD_ID(x); a1 < D1D)
+      {
+         real_t us[D1D];
+         MFEM_UNROLL(D1D)
+         for (int a2 = 0; a2 < D1D; a2++)
+         {
+            if (a1 + a2 >= D1D)
+            {
+               break;
+            }
+            us[a2] = X[ij_to_index(D1D, a2, a1)];
+         }
+
+         MFEM_UNROLL(Q1D)
+         for (int i2 = 0; i2 < Q1D; i2++)
+         {
+            real_t uu = 0.0;
+            MFEM_UNROLL(D1D)
+            for (int a2 = 0; a2 < D1D; ++a2)
+            {
+               if (a2 >= D1D-a1)
+               {
+                  break;
+               }
+               uu += us[a2] * Ba2[a1][i2][a2];
+            }
+            DQ[a1][i2] = uu;
+         }
+      }
+      MFEM_SYNC_THREAD;
+      // quad to dofs operation, step 2: convert second quadrature index to second
+      // multiindex. QQ corresponds to C2 in the AAD algorithm, which contains the Bernstein
+      // polynomial on a triangle with coefficients X evaluated at
+      // all of the Stroud quadrature nodes. E.g. if (t1,t2) is a Stroud node, then
+      //    C2[i,j] = \sum_{\alpha} X_{\alpha} * B_{\alpha}^{p-1}(\Phi(t1,t2)),
+      // where \Phi is the Duffy transform.
+      if (int i2 = MFEM_THREAD_ID(x); i2 < Q1D)
+      {
+         real_t us[D1D];
+         MFEM_UNROLL(D1D)
+         for (int a1 = 0; a1 < D1D; a1++)
+         {
+            us[a1] = DQ[a1][i2];
+         }
+
+         MFEM_UNROLL(Q1D)
+         for (int i1 = 0; i1 < Q1D; i1++)
+         {
+            real_t u = 0.0;
+            MFEM_UNROLL(D1D)
+            for (int a1 = 0; a1 < D1D; a1++)
+            {
+               u += us[a1] * Ba1<D1D, Q1D>[a1][i1];
+            }
+            QQ[i1][i2] = u * D(i1, i2, e);
+         }
+      }
+      MFEM_SYNC_THREAD;
+      // dofs to quad operation, step 1: convert first multiindex to first quadrature
+      // index. DQ corresponds to F1 in the AAD algorithm, with F0 corresponding to
+      // C2 * D.
+      if (int i2 = MFEM_THREAD_ID(x); i2 < Q1D)
+      {
+         real_t us[Q1D];
+         MFEM_UNROLL(Q1D)
+         for (int i1 = 0; i1 < Q1D; i1++)
+         {
+            us[i1] = QQ[i1][i2];
+         }
+
+         MFEM_UNROLL(D1D)
+         for (int a1 = 0; a1 < D1D; a1++)
+         {
+            real_t u = 0.0;
+            MFEM_UNROLL(Q1D)
+            for (int i1 = 0; i1 < Q1D; i1++)
+            {
+               u += us[i1] * Ba1<D1D, Q1D>[a1][i1];
+            }
+            DQ[a1][i2] = u;
+         }
+      }
+      MFEM_SYNC_THREAD;
+      // dofs to quad operation, step 2: convert second multiindex to second
+      // quadrature index. u corresponds to F2 in the AAD algorithm. The contribution
+      // to the local RHS is
+      //       Y_{\alpha} = F2_{\alpha}.
+      // compute F2 from AAD algorithm and add contributions to RHS
+      if (int a1 = MFEM_THREAD_ID(x); a1 < D1D)
+      {
+         real_t us[Q1D];
+         MFEM_UNROLL(Q1D)
+         for (int i2 = 0; i2 < Q1D; i2++)
+         {
+            us[i2] = DQ[a1][i2];
+         }
+
+         MFEM_UNROLL(D1D)
+         for (int a2 = 0; a2 < D1D; ++a2)
+         {
+            if (a2 >= D1D-a1)
+            {
+               break;
+            }
+            real_t u = 0.0;
+            MFEM_UNROLL(Q1D)
+            for (int i2 = 0; i2 < Q1D; i2++)
+            {
+               u += us[i2] * Ba2[a1][i2][a2];
+            }
+
+            int idx = ij_to_index(D1D, a2, a1);
+            Y(idx,e) += u;
+         }
+      }
    });
 }
 
@@ -1965,11 +1815,11 @@ inline void PAMassApplyTetrahedron(const int NE,
 // Shared memory PA Mass Apply 3D Kernel on tetrahedrons (Bernstein only)
 template<int T_D1D = 0, int T_Q1D = 0>
 inline void SmemPAMassApplyTetrahedron(const int NE,
-                                       const Array<int> &lex_map_,
-                                       const Array<int> &forward_map2d_,
-                                       const Array<int> &inverse_map2d_,
-                                       const Array<int> &forward_map3d_,
-                                       const Array<int> &inverse_map3d_,
+                                       const Array<int> &,
+                                       const Array<int> &,
+                                       const Array<int> &,
+                                       const Array<int> &,
+                                       const Array<int> &,
                                        const Array<real_t> &ba1_,
                                        const Array<real_t> &ba2_,
                                        const Array<real_t> &ba3_,
@@ -1980,40 +1830,335 @@ inline void SmemPAMassApplyTetrahedron(const int NE,
                                        const Vector &d_,
                                        const Vector &x_,
                                        Vector &y_,
-                                       const int d1d = 0,
-                                       const int q1d = 0)
+                                       const int,
+                                       const int)
 {
-   const int D1D = T_D1D ? T_D1D : d1d;
-   const int Q1D = T_Q1D ? T_Q1D : q1d;
+   static_assert(T_D1D != 0);
+   static_assert(T_Q1D != 0);
+   const int D1D = T_D1D;
+   const int Q1D = T_Q1D;
    const int max_q1d = T_Q1D ? T_Q1D : DeviceDofQuadLimits::Get().MAX_Q1D;
    const int max_d1d = T_D1D ? T_D1D : DeviceDofQuadLimits::Get().MAX_D1D;
    MFEM_VERIFY(D1D <= max_d1d, "");
    MFEM_VERIFY(Q1D <= max_q1d, "");
 
-   const int BASIS_DIM = D1D * (D1D + 1) * (D1D + 2) / 6;
-   const int BASIS_DIM2D = D1D * (D1D + 1) / 2;
-   // const auto lex_map = lex_map_.Read();
-   const auto forward_map2d = forward_map2d_.Read();
-   const auto inverse_map2d = inverse_map2d_.Read();
-   const auto forward_map3d = forward_map3d_.Read();
-   // const auto inverse_map3d = inverse_map3d_.Read();
-   const auto Ba1 = ba1_.Read();
-   const auto Ba2 = ba2_.Read();
-   const auto Ba3 = ba3_.Read();
-   const auto T = t_.Read();
+   const auto Ba2_ptr = ba2_.Read();
+   const auto Ba3_ptr = ba3_.Read();
+   const auto T_ptr = t_.Read();
    // const auto Ba1t = ba1t_.Read();
    // const auto Ba2t = ba2t_.Read();
    // const auto Ba3t = ba3t_.Read();
-   const auto D = d_.Read();
-   const auto X = x_.Read();
-   auto Y = y_.ReadWrite();
+   const auto D_ptr = d_.Read();
+   const auto X_ptr = x_.Read();
+   auto Y_ptr = y_.ReadWrite();
 
-
-   mfem::forall_2D(NE, Q1D, Q1D*Q1D, [=] MFEM_HOST_DEVICE (int e)
+   if (!Ba1_initialized<T_D1D, T_Q1D>)
    {
-      internal::SmemPAMassApplyTetrahedron_Element<T_D1D, T_Q1D>(e, NE, BASIS_DIM,
-                                                                 BASIS_DIM2D, forward_map2d,
-                                                                 inverse_map2d, forward_map3d, Ba1, Ba2, Ba3, T, D, X, Y, d1d, q1d);
+      MFEM_GPU_CHECK(cudaMemcpyToSymbol(Ba1<D1D, Q1D>, ba1_.Read(), sizeof(Ba1<D1D, Q1D>), 0, cudaMemcpyDeviceToDevice));
+      Ba1_initialized<T_D1D, T_Q1D> = true;
+   }
+
+   static const int BLK = std::max(Q1D, D1D);
+   static const int BZ = std::min(64, 128 / (BLK * BLK));
+
+   mfem::forall_2D_batch(NE, BLK, BLK, BZ, [=] MFEM_HOST_DEVICE (int e)
+   {
+      constexpr int D1D = T_D1D;
+      constexpr int Q1D = T_Q1D;
+      constexpr int MQ1 = T_Q1D ? T_Q1D : DofQuadLimits::MAX_Q1D;
+      constexpr int MD1 = T_D1D ? T_D1D : DofQuadLimits::MAX_D1D;
+      constexpr int MDQ = (MQ1 > MD1) ? MQ1 : MD1;
+      constexpr int BASIS_DIM2D_MASS = MD1 * (MD1 + 1) / 2;
+      constexpr int BASIS_DIM3D_MASS = MD1 * (MD1 + 1) * (MD1 + 2) / 6;
+
+      const auto d = DeviceTensor<4,const real_t>(D_ptr, Q1D, Q1D, Q1D, NE);
+      const auto x = ConstDeviceMatrix(X_ptr, BASIS_DIM3D_MASS, NE);
+      auto y = DeviceMatrix(Y_ptr, BASIS_DIM3D_MASS, NE);
+
+      MFEM_SHARED real_t Ba2[BASIS_DIM2D_MASS][MQ1];
+      MFEM_SHARED real_t Ba3[BASIS_DIM3D_MASS][MQ1];
+      MFEM_SHARED union
+      {
+         real_t points[BZ][D1D][D1D][Q1D];
+         real_t X[BZ][BASIS_DIM3D_MASS];
+      } sm;
+      auto X = (real_t (*)) sm.X[MFEM_THREAD_ID(z)];
+
+      auto C1 = sm.points[MFEM_THREAD_ID(z)];
+      auto C2 = sm.points[MFEM_THREAD_ID(z)];
+      auto C3 = sm.points[MFEM_THREAD_ID(z)];
+      auto F1 = sm.points[MFEM_THREAD_ID(z)];
+      auto F2 = sm.points[MFEM_THREAD_ID(z)];
+
+      const int local_3d_id = MFEM_THREAD_ID(x) + MFEM_THREAD_ID(y) * BLK + MFEM_THREAD_ID(z) * BLK * BLK;
+      const int local_2d_id = MFEM_THREAD_ID(x) + MFEM_THREAD_ID(y) * BLK;
+
+      const int alive_thread_count = BLK * BLK * min(BZ, NE - MFEM_BLOCK_ID(x) * BZ);
+
+      for (int i = local_3d_id; i < Q1D * BASIS_DIM2D_MASS; i += alive_thread_count)
+      {
+         ((real_t *)Ba2)[i] = Ba2_ptr[i];
+      }
+
+      for (int i = local_3d_id; i < Q1D * BASIS_DIM3D_MASS; i += alive_thread_count)
+      {
+         ((real_t *)Ba3)[i] = Ba3_ptr[i];
+      }
+
+      for (int i = local_2d_id; i < BASIS_DIM3D_MASS; i += BLK * BLK)
+      {
+         X[i] = x(i,e);
+      }
+
+      MFEM_SYNC_THREAD;
+
+      {
+         real_t us[D1D];
+
+         if (int a1 = MFEM_THREAD_ID(y); a1 < D1D)
+         {
+            if (int a2 = MFEM_THREAD_ID(x); a2 < D1D-a1)
+            {
+               MFEM_UNROLL(D1D)
+               for (int a3 = 0; a3 < D1D; a3++)
+               {
+                  if (a1 + a2 + a3 >= D1D)
+                  {
+                     break;
+                  }
+                  us[a3] = X[ijk_to_index(D1D, a1, a2, a3)];
+               }
+            }
+         }
+
+         MFEM_SYNC_THREAD;
+
+         if (int a1 = MFEM_THREAD_ID(y); a1 < D1D)
+         {
+            if (int a2 = MFEM_THREAD_ID(x); a2 < D1D-a1)
+            {
+               MFEM_UNROLL(Q1D)
+               for (int i3 = 0; i3 < Q1D; i3++)
+               {
+                  real_t u = 0.0;
+                  MFEM_UNROLL(D1D)
+                  for (int a3 = 0; a3 < D1D; a3++)
+                  {
+                     if (a1 + a2 + a3 >= D1D)
+                     {
+                        break;
+                     }
+                     const int a = ijk_to_index(D1D, a1, a2, a3);
+                     u += us[a3] * Ba3[a][i3];
+                  }
+                  C1[a1][a2][i3] = u;
+               }
+            }
+         }
+      }
+
+      MFEM_SYNC_THREAD;
+
+      {
+         real_t us[D1D];
+         if (int a1 = MFEM_THREAD_ID(y); a1 < D1D)
+         {
+            if (int a3 = MFEM_THREAD_ID(x); a3 < Q1D)
+            {
+               MFEM_UNROLL(D1D)
+               for (int a2 = 0; a2 < D1D; a2++)
+               {
+                  if (a1 + a2 >= D1D)
+                  {
+                     break;
+                  }
+                  us[a2] = C1[a1][a2][a3];
+               }
+            }
+         }
+
+         MFEM_SYNC_THREAD;
+
+         if (int a1 = MFEM_THREAD_ID(y); a1 < D1D)
+         {
+            if (int a3 = MFEM_THREAD_ID(x); a3 < Q1D)
+            {
+               MFEM_UNROLL(Q1D)
+               for (int i2 = 0; i2 < Q1D; i2++)
+               {
+                  real_t u = 0.0;
+                  MFEM_UNROLL(D1D)
+                  for (int a2 = 0; a2 < D1D; a2++)
+                  {
+                     if (a1 + a2 >= D1D)
+                     {
+                        break;
+                     }
+                     const int a_2d = ij_to_index(D1D, a2, a1);
+                     u += us[a2] * Ba2[a_2d][i2];
+                  }
+                  C2[a1][i2][a3] = u;
+               }
+            }
+         }
+      }
+
+      MFEM_SYNC_THREAD;
+
+      {
+         real_t us[D1D];
+         if (int a2 = MFEM_THREAD_ID(y); a2 < Q1D)
+         {
+            if (int a3 = MFEM_THREAD_ID(x); a3 < Q1D)
+            {
+               MFEM_UNROLL(D1D)
+               for (int a1 = 0; a1 < D1D; a1++)
+               {
+                  us[a1] = C2[a1][a2][a3];
+               }
+            }
+         }
+
+         MFEM_SYNC_THREAD;
+
+         if (int a2 = MFEM_THREAD_ID(y); a2 < Q1D)
+         {
+            if (int a3 = MFEM_THREAD_ID(x); a3 < Q1D)
+            {
+               MFEM_UNROLL(Q1D)
+               for (int i1 = 0; i1 < Q1D; i1++)
+               {
+                  real_t u = 0.0;
+                  MFEM_UNROLL(D1D)
+                  for (int a1 = 0; a1 < D1D; a1++)
+                  {
+                     u += us[a1] * Ba1<D1D, Q1D>[a1][i1];
+                  }
+                  C3[i1][a2][a3] = u * d(i1,a2,a3,e);
+               }
+            }
+         }
+      }
+
+      MFEM_SYNC_THREAD;
+
+      {
+         real_t us[Q1D];
+         if (int a2 = MFEM_THREAD_ID(y); a2 < Q1D)
+         {
+            if (int a3 = MFEM_THREAD_ID(x); a3 < Q1D)
+            {
+               MFEM_UNROLL(Q1D)
+               for (int i1 = 0; i1 < Q1D; i1++)
+               {
+                  us[i1] = C3[i1][a2][a3];
+               }
+            }
+         }
+
+         MFEM_SYNC_THREAD;
+
+         if (int a2 = MFEM_THREAD_ID(y); a2 < Q1D)
+         {
+            if (int a3 = MFEM_THREAD_ID(x); a3 < Q1D)
+            {
+               MFEM_UNROLL(D1D)
+               for (int a1 = 0; a1 < D1D; a1++)
+               {
+                  real_t u = 0.0;
+                  MFEM_UNROLL(Q1D)
+                  for (int i1 = 0; i1 < Q1D; i1++)
+                  {
+                     u += us[i1] * Ba1<D1D, Q1D>[a1][i1];
+                  }
+                  F1[a1][a2][a3] = u;
+               }
+            }
+         }
+      }
+
+      MFEM_SYNC_THREAD;
+
+      {
+         real_t us[Q1D];
+         if (int a1 = MFEM_THREAD_ID(y); a1 < D1D)
+         {
+            if (int a3 = MFEM_THREAD_ID(x); a3 < Q1D)
+            {
+               MFEM_UNROLL(Q1D)
+               for (int i2 = 0; i2 < Q1D; i2++)
+               {
+                  us[i2] = F1[a1][i2][a3];
+               }
+            }
+         }
+
+         MFEM_SYNC_THREAD;
+
+         if (int a1 = MFEM_THREAD_ID(y); a1 < D1D)
+         {
+            if (int a3 = MFEM_THREAD_ID(x); a3 < Q1D)
+            {
+               MFEM_UNROLL(D1D)
+               for (int a2 = 0; a2 < D1D; a2++)
+               {
+                  if (a1 + a2 >= D1D)
+                  {
+                     break;
+                  }
+                  const int a_2d = ij_to_index(D1D, a2, a1);
+                  real_t u = 0.0;
+                  MFEM_UNROLL(Q1D)
+                  for (int i2 = 0; i2 < Q1D; i2++) {
+                     u += us[i2] * Ba2[a_2d][i2];
+                  }
+                  F2[a1][a2][a3] = u;
+               }
+            }
+         }
+      }
+
+      MFEM_SYNC_THREAD;
+
+      {
+         real_t us[Q1D];
+         if (int a1 = MFEM_THREAD_ID(y); a1 < D1D)
+         {
+            if (int a2 = MFEM_THREAD_ID(x); a2 < D1D-a1)
+            {
+               MFEM_UNROLL(Q1D)
+               for (int i3 = 0; i3 < Q1D; i3++)
+               {
+                  us[i3] = F2[a1][a2][i3];
+               }
+            }
+         }
+
+         MFEM_SYNC_THREAD;
+
+         if (int a1 = MFEM_THREAD_ID(y); a1 < D1D)
+         {
+            if (int a2 = MFEM_THREAD_ID(x); a2 < D1D-a1)
+            {
+               MFEM_UNROLL(D1D)
+               for (int a3 = 0; a3 < D1D; a3++)
+               {
+                  if (a1 + a2 + a3 >= D1D)
+                  {
+                     break;
+                  }
+                  const int a = ijk_to_index(D1D, a1, a2, a3);
+                  real_t u = 0.0;
+                  MFEM_UNROLL(Q1D)
+                  for (int i3 = 0; i3 < Q1D; i3++) {
+                     u += us[i3] * Ba3[a][i3];
+                  }
+
+                  y(a,e) += u;
+               }
+            }
+         }
+      }
    });
 
    // mfem::forall_3D(NE, Q1D, Q1D, Q1D, [=] MFEM_HOST_DEVICE (int e)
