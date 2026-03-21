@@ -1881,14 +1881,14 @@ inline void SmemPAMassApplyTetrahedron(const int NE,
       {
          real_t points[BZ][D1D][D1D][Q1D];
          real_t X[BZ][BASIS_DIM3D_MASS];
-      } sm;
-      auto X = (real_t (*)) sm.X[MFEM_THREAD_ID(z)];
+      } sm[2];
+      auto X = (real_t (*)) sm[1].X[MFEM_THREAD_ID(z)];
 
-      auto C1 = sm.points[MFEM_THREAD_ID(z)];
-      auto C2 = sm.points[MFEM_THREAD_ID(z)];
-      auto C3 = sm.points[MFEM_THREAD_ID(z)];
-      auto F1 = sm.points[MFEM_THREAD_ID(z)];
-      auto F2 = sm.points[MFEM_THREAD_ID(z)];
+      auto C1 = sm[0].points[MFEM_THREAD_ID(z)];
+      auto C2 = sm[1].points[MFEM_THREAD_ID(z)];
+      auto C3 = sm[0].points[MFEM_THREAD_ID(z)];
+      auto F1 = sm[1].points[MFEM_THREAD_ID(z)];
+      auto F2 = sm[0].points[MFEM_THREAD_ID(z)];
 
       const int local_3d_id = MFEM_THREAD_ID(x) + MFEM_THREAD_ID(y) * BLK + MFEM_THREAD_ID(z) * BLK * BLK;
       const int local_2d_id = MFEM_THREAD_ID(x) + MFEM_THREAD_ID(y) * BLK;
@@ -1931,7 +1931,7 @@ inline void SmemPAMassApplyTetrahedron(const int NE,
             }
          }
 
-         MFEM_SYNC_THREAD;
+         // MFEM_SYNC_THREAD;
 
          if (int a1 = MFEM_THREAD_ID(y); a1 < D1D)
          {
@@ -1977,7 +1977,7 @@ inline void SmemPAMassApplyTetrahedron(const int NE,
             }
          }
 
-         MFEM_SYNC_THREAD;
+         // MFEM_SYNC_THREAD;
 
          if (int a1 = MFEM_THREAD_ID(y); a1 < D1D)
          {
@@ -2019,7 +2019,7 @@ inline void SmemPAMassApplyTetrahedron(const int NE,
             }
          }
 
-         MFEM_SYNC_THREAD;
+         // MFEM_SYNC_THREAD;
 
          if (int a2 = MFEM_THREAD_ID(y); a2 < Q1D)
          {
@@ -2056,7 +2056,7 @@ inline void SmemPAMassApplyTetrahedron(const int NE,
             }
          }
 
-         MFEM_SYNC_THREAD;
+         // MFEM_SYNC_THREAD;
 
          if (int a2 = MFEM_THREAD_ID(y); a2 < Q1D)
          {
@@ -2093,7 +2093,7 @@ inline void SmemPAMassApplyTetrahedron(const int NE,
             }
          }
 
-         MFEM_SYNC_THREAD;
+         // MFEM_SYNC_THREAD;
 
          if (int a1 = MFEM_THREAD_ID(y); a1 < D1D)
          {
@@ -2134,7 +2134,7 @@ inline void SmemPAMassApplyTetrahedron(const int NE,
             }
          }
 
-         MFEM_SYNC_THREAD;
+         // MFEM_SYNC_THREAD;
 
          if (int a1 = MFEM_THREAD_ID(y); a1 < D1D)
          {
